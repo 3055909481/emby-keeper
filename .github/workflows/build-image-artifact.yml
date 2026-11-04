@@ -1,0 +1,39 @@
+name: Build Docker Image Artifact
+
+on:
+  workflow_dispatch:   # 只允许手动触发，避免误跑
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image to tar
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deploy/panel/Dockerfile
+          target: release
+          platforms: linux/amd64          # 若服务器是 ARM 请改成 linux/arm64
+          tags: my-embykeeper:latest
+          outputs: type=docker,dest=/tmp/embykeeper-image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: embykeeper-image
+          path: /tmp/embykeeper-image.tar
+          retention-days: 7
