@@ -23,10 +23,14 @@ basedir="${EMBYKEEPERAPI_BASEDIR:-/app}"
 
 mkdir -p "${basedir}"
 
-# 空 TOML 是合法的, 表示全部使用默认配置; 面板的「系统设置」页会按需写入
-if [ ! -f "${basedir}/config.toml" ]; then
-    : > "${basedir}/config.toml"
-    echo ">> 已生成配置文件 ${basedir}/config.toml (默认配置, 可直接在面板中修改)."
+if [ -n "${EK_MONGODB:-}" ]; then
+    echo ">> 检测到 EK_MONGODB: 配置、缓存与面板设置将保存在 MongoDB, 无需挂载数据目录."
+else
+    # 空 TOML 是合法的, 表示全部使用默认配置; 面板的「系统设置」页会按需写入
+    if [ ! -f "${basedir}/config.toml" ]; then
+        : > "${basedir}/config.toml"
+        echo ">> 已生成配置文件 ${basedir}/config.toml (默认配置, 可直接在面板中修改)."
+    fi
 fi
 
 if [ -z "${EK_WEBPASS}" ]; then
@@ -36,6 +40,14 @@ if [ -z "${EK_WEBPASS}" ]; then
 fi
 
 echo ">> 数据目录: ${basedir}"
-echo ">> 面板地址: http://<服务器地址>:8000 (容器内端口 8000)"
+port=8000
+previous=""
+for argument in "$@"; do
+    if [ "${previous}" = "--port" ]; then
+        port="${argument}"
+    fi
+    previous="${argument}"
+done
+echo ">> 面板地址: http://<服务器地址>:${port} (容器内端口 ${port})"
 
 exec "embykeeper" "$@"

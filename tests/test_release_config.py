@@ -187,6 +187,30 @@ class DockerReleaseTests(unittest.TestCase):
                     self.assertEqual(build["file"], "./deploy/panel/Dockerfile")
                     self.assertEqual(build["target"], target)
 
+    def test_huggingface_space_runs_the_panel_on_its_app_port(self):
+        root = Path(__file__).resolve().parents[1]
+        dockerfile = (root / "hf" / "Dockerfile").read_text()
+        self.assertRegex(dockerfile, r"FROM embykeeper/embykeeper:v\d+\.\d+\.\d+")
+        # Huggingface runs the container as UID 1000 and proxies the Space app_port.
+        self.assertIn('CMD ["web", "--port", "1818"]', dockerfile)
+        self.assertIn("EMBYKEEPERAPI_BASEDIR=/data", dockerfile)
+        self.assertIn("chown -R 1000:1000 /data", dockerfile)
+        workflow = yaml.safe_load((root / ".github" / "workflows" / "docker.yml").read_text())
+        self.assertIn("sync-to-hf", workflow["jobs"])
+
+    def test_release_draft_lists_commits_since_the_previous_tag(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = yaml.safe_load((root / ".github" / "workflows" / "draft-release.yml").read_text())
+        steps = workflow["jobs"]["draft"]["steps"]
+        checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout"))
+        self.assertEqual(checkout["with"]["fetch-depth"], 0)
+        script = next(step["run"] for step in steps if "release-notes.md" in step.get("run", ""))
+        self.assertIn("git log --no-merges --pretty=", script)
+        self.assertIn("compare/${previous}...${tag}", script)
+        body = (root / ".github" / "RELEASE_BODY.md").read_text()
+        self.assertNotIn("v0.0.0", body)
+        self.assertNotIn("8.0.1", body)
+
     def test_compose_and_user_guide_use_the_published_web_image_without_building(self):
         root = Path(__file__).resolve().parents[1]
         guide = (root / "docs" / "guide" / "面板模式部署.md").read_text(encoding="utf-8")
@@ -211,7 +235,7 @@ class DockerReleaseTests(unittest.TestCase):
         for name, text in file_texts.items():
             with self.subTest(source=name):
                 self.assertIsNone(re.search(r"\bTZ\b", text))
-        self.assertIn('EK_WEBPASS: "your-password"', file_texts["guide"])
+        self.assertRegex(file_texts["guide"], r"""EK_WEBPASS: ['"]your-password['"]""")
         self.assertIn("EK_WEBPASS=your-password", file_texts["env"])
         self.assertIn("EK_WEBPASS='your-password'", (root / "README.md").read_text(encoding="utf-8"))
 
@@ -225,6 +249,21 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertTrue(archiving)
         for filename in ("Start-Embykeeper.bat", "install.ps1", "version.txt"):
             self.assertIn(filename, archiving[0]["run"])
+
+    def test_manual_dispatch_publishes_the_installer_and_wheel_for_testing(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = yaml.safe_load((root / ".github" / "workflows" / "windows.yml").read_text())
+        artifacts = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("uses", "").startswith("actions/upload-artifact")
+        ]
+        # Both the installer zip and the wheel are downloadable before a release exists.
+        self.assertEqual(len(artifacts), 2)
+        for step in artifacts:
+            self.assertIn("workflow_dispatch", step["if"])
+        self.assertIn("dist/*.whl", artifacts[1]["with"]["path"])
 
     def test_installer_embeds_python_and_falls_back_between_indexes(self):
         root = Path(__file__).resolve().parents[1]
