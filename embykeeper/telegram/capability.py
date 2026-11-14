@@ -99,6 +99,44 @@ class CapabilityProvider:
             kwargs["proxy"] = proxy
         return httpx.AsyncClient(**kwargs)
 
+    async def _chat_once(
+        self,
+        model: str,
+        *,
+        base: str,
+        headers: dict,
+        content: Any,
+        system: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """发起单次 /chat/completions 请求, 返回 (答案, 来源标识)."""
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+        }
+        # 默认不发送该参数: Ollama / DeepSeek / 部分中转会因未知字段返回 400.
+        effort = str(settings.get("llm_reasoning_effort") or "").strip()
+        if effort:
+            payload["reasoning_effort"] = effort
+        try:
+            async with self._client(
+                timeout=_as_float(settings.get("llm_timeout"), 40),
+                proxy=str(settings.get("llm_proxy") or ""),
+            ) as client:
+                resp = await client.post(f"{base}/chat/completions", json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+            answer = (data["choices"][0]["message"].get("content") or "").strip()
+            if not answer:
+                log.warning(f"模型 {model} 返回空内容 (推理型模型可能把答案放在 reasoning 字段), 视为失败")
+                return None, None
+            return answer, f"local:{model}"
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
+            log.warning(f"本地模型调用失败 ({model}): {_http_error_detail(e)}")
+            return None, None
+
     async def chat(
         self,
         prompt: str,
@@ -107,13 +145,16 @@ class CapabilityProvider:
         vision: bool = False,
         system: str = ANSWER_SYSTEM,
     ) -> Tuple[Optional[str], Optional[str]]:
-        """调用 OpenAI 兼容的 /chat/completions, 返回 (答案, 来源标识)."""
+        """调用 OpenAI 兼容的 /chat/completions, 失败时按需切换备用模型."""
         base = str(settings.get("llm_base_url") or "").rstrip("/")
         if not base:
             return None, None
 
         vision_model = str(settings.get("llm_vision_model") or "")
-        model = vision_model if vision and vision_model else str(settings.get("llm_model") or "gpt-4o-mini")
+        if vision and vision_model:
+            model = vision_model
+        else:
+            model = str(settings.get("llm_model") or "gpt-5.6-terra")
         if image:
             encoded = base64.b64encode(image).decode()
             content = [
@@ -128,26 +169,15 @@ class CapabilityProvider:
         if key:
             headers["Authorization"] = f"Bearer {key}"
 
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": content},
-            ],
-        }
-        try:
-            async with self._client(
-                timeout=_as_float(settings.get("llm_timeout"), 40),
-                proxy=str(settings.get("llm_proxy") or ""),
-            ) as client:
-                resp = await client.post(f"{base}/chat/completions", json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-            answer = (data["choices"][0]["message"].get("content") or "").strip()
-            return (answer, f"local:{model}") if answer else (None, None)
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
-            log.warning(f"本地模型调用失败 ({model}): {_http_error_detail(e)}")
-            return None, None
+        answer, by = await self._chat_once(model, base=base, headers=headers, content=content, system=system)
+        if answer:
+            return answer, by
+
+        fallback = str(settings.get("llm_fallback_model") or "").strip()
+        if fallback and fallback != model:
+            log.warning(f"主模型 {model} 未返回有效答案, 尝试使用备用模型 {fallback}")
+            return await self._chat_once(fallback, base=base, headers=headers, content=content, system=system)
+        return None, None
 
     async def solve_captcha(self, site: str, url: Optional[str] = None, kind: str = "token") -> Optional[str]:
         """调用自建 Turnstile / hCaptcha solver.

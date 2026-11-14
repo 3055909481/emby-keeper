@@ -11,6 +11,8 @@ type CapabilityForm = {
   llm_api_key: string
   llm_model: string
   llm_vision_model: string
+  llm_reasoning_effort: string
+  llm_fallback_model: string
   llm_proxy: string
   llm_timeout: number
   captcha_enabled: boolean
@@ -21,7 +23,7 @@ type CapabilityForm = {
 }
 
 type CapabilityResponse = CapabilityForm & { env_overrides?: string[] }
-type TestTarget = 'llm' | 'captcha'
+type TestTarget = 'llm' | 'llm_vision' | 'captcha'
 type TestResponse = { success: boolean; detail: string }
 
 const auth = useAuthStore()
@@ -30,8 +32,10 @@ const form = reactive<CapabilityForm>({
   llm_enabled: true,
   llm_base_url: '',
   llm_api_key: '',
-  llm_model: 'gpt-4o-mini',
+  llm_model: 'gpt-5.6-terra',
   llm_vision_model: '',
+  llm_reasoning_effort: '',
+  llm_fallback_model: '',
   llm_proxy: '',
   llm_timeout: 40,
   captcha_enabled: true,
@@ -43,8 +47,12 @@ const form = reactive<CapabilityForm>({
 
 const loading = ref(false)
 const saving = ref(false)
-const testing = reactive<Record<TestTarget, boolean>>({ llm: false, captcha: false })
-const testResult = reactive<Record<TestTarget, TestResponse | null>>({ llm: null, captcha: null })
+const testing = reactive<Record<TestTarget, boolean>>({ llm: false, llm_vision: false, captcha: false })
+const testResult = reactive<Record<TestTarget, TestResponse | null>>({
+  llm: null,
+  llm_vision: null,
+  captcha: null,
+})
 const envOverrides = ref<string[]>([])
 const error = ref('')
 const notice = ref('')
@@ -161,11 +169,27 @@ onMounted(load)
             </label>
             <label class="space-y-2 text-sm text-slate-600">
               <span class="font-medium text-slate-900">文本模型</span>
-              <input v-model="form.llm_model" :disabled="!form.llm_enabled" type="text" :class="inputClass" placeholder="gpt-4o-mini" />
+              <input v-model="form.llm_model" :disabled="!form.llm_enabled" type="text" :class="inputClass" placeholder="gpt-5.6-terra" />
             </label>
             <label class="space-y-2 text-sm text-slate-600">
               <span class="font-medium text-slate-900">视觉模型</span>
               <input v-model="form.llm_vision_model" :disabled="!form.llm_enabled" type="text" :class="inputClass" placeholder="留空则复用文本模型" />
+            </label>
+            <label class="space-y-2 text-sm text-slate-600">
+              <span class="font-medium text-slate-900">推理强度</span>
+              <select v-model="form.llm_reasoning_effort" :disabled="!form.llm_enabled" :class="inputClass">
+                <option value="">不发送（默认）</option>
+                <option value="none">none — 关闭推理</option>
+                <option value="low">low — 轻度推理</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+              </select>
+              <span class="block text-xs text-slate-400">仅在中转支持时填写，否则可能返回 400；GPT-6 / Astra 不支持 none，请用 low。</span>
+            </label>
+            <label class="space-y-2 text-sm text-slate-600">
+              <span class="font-medium text-slate-900">备用模型</span>
+              <input v-model="form.llm_fallback_model" :disabled="!form.llm_enabled" type="text" :class="inputClass" placeholder="留空表示不启用" />
+              <span class="block text-xs text-slate-400">主模型报错或返回空内容时自动重试一次；需同样支持图片输入。</span>
             </label>
             <label class="space-y-2 text-sm text-slate-600">
               <span class="font-medium text-slate-900">代理（可选）</span>
@@ -178,10 +202,14 @@ onMounted(load)
           </div>
           <div class="flex flex-wrap items-center gap-3 border-t border-slate-200/80 pt-4">
             <UiButton size="sm" variant="secondary" :loading="testing.llm" :disabled="testing.llm" @click="test('llm')">测试模型连接</UiButton>
+            <UiButton size="sm" variant="secondary" :loading="testing.llm_vision" :disabled="testing.llm_vision" @click="test('llm_vision')">测试视觉连接</UiButton>
             <span class="text-xs text-slate-400">测试使用已保存的配置，会发起一次真实模型请求。</span>
           </div>
           <p v-if="testResult.llm" class="rounded-[16px] px-3 py-2 text-sm" :class="testResult.llm.success ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'">
             {{ testResult.llm.detail }}
+          </p>
+          <p v-if="testResult.llm_vision" class="rounded-[16px] px-3 py-2 text-sm" :class="testResult.llm_vision.success ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'">
+            {{ testResult.llm_vision.detail }}
           </p>
         </div>
       </UiCard>
@@ -240,6 +268,9 @@ onMounted(load)
       <div class="space-y-3 text-sm leading-6 text-slate-600">
         <p>· 配置保存在容器内 <span class="font-mono">/app/capability.json</span>，随数据卷持久化，不写入 config.toml；保存后按文件修改时间自动重载，无需重启。</p>
         <p>· 优先级：环境变量 <span class="font-mono">EK_LLM_* / EK_CAPTCHA_*</span> &gt; 本页设置 &gt; 未配置。环境变量存在时页面上方会提示。</p>
+        <p>· 推理强度默认「不发送」，兼容性最好；填写后请求会带上 <span class="font-mono">reasoning_effort</span>。GPT-6 / Astra 等模型不支持 <span class="font-mono">none</span>，请选 <span class="font-mono">low</span>；若端点不认识该参数会返回 400，改回「不发送」即可。</p>
+        <p>· 备用模型在主模型报错、超时或返回空内容时自动重试一次，日志会标明实际使用的模型；视觉请求同样会兜底，因此备用模型也需支持图片输入。</p>
+        <p>· 「测试视觉连接」会发送一张纯色小图验证图片通道，只要返回非空内容即算通过，不要求答对颜色。</p>
         <p>· 图片验证码 OCR 使用镜像自带的 ddddocr，<span class="font-medium text-slate-900">无需任何配置</span>。</p>
         <p>· 未配置的能力会快速返回空值，对应站点自动跳过，不会再卡在 60 秒 × 3 次的云端重试上；普通签到与 Emby 保活不依赖这些服务。</p>
         <p>· Cloudflare 反向隧道（wssocks）的服务端在作者侧，目前没有本地替代，仅在 Emby 遇到 CF 挑战时会受影响。</p>
