@@ -7,6 +7,7 @@ import tempfile
 import glob
 import sqlite3
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import List
 import os
@@ -250,28 +251,69 @@ class ClientsSession:
             return False
 
     async def test_time(self):
-        url = "https://ip.ddnspod.com/timestamp"
+        """检测本地系统时间是否与世界时间同步 (仅预警, 不阻塞登录).
+
+        上游 ip.ddnspod.com/timestamp 已改版为纯 IP 回显服务, 不再返回时间戳,
+        int(resp.content.decode()) 必然抛 ValueError. 这里改为:
+        1) 优先读取多个站点的 HTTP Date 响应头 (通用, 不依赖单一时间接口);
+        2) 兼容仍返回纯数字时间戳的接口 (自动识别秒 / 毫秒);
+        3) 任何异常只做一次汇总告警, 不再打印 traceback 干扰日志.
+        """
         proxy_str = get_proxy_str(self.proxy)
+        # 国内外都能快速响应的站点, 第一个成功即返回
+        date_sources = (
+            "https://www.baidu.com",
+            "https://www.qq.com",
+            "https://www.cloudflare.com",
+            "https://telegram.org",
+        )
+        numeric_sources = ("https://ip.ddnspod.com/timestamp",)
+
+        remote_ts = None
         try:
-            async with httpx.AsyncClient(http2=True, proxy=proxy_str) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    timestamp = int(resp.content.decode())
-                else:
-                    logger.warning(f"世界时间接口异常, 系统时间检测将跳过, 敬请注意. 程序将继续运行.")
-                    return False
-                nowtime = datetime.now(timezone.utc).timestamp()
-                if abs(nowtime - timestamp / 1000) > 30:
-                    logger.warning(
-                        f"您的系统时间设置不正确, 与世界时间差距过大, 可能会导致连接失败, 敬请注意. 程序将继续运行."
-                    )
-        except httpx.HTTPError:
-            logger.warning(f"检测世界时间发生错误, 时间检测将被跳过.")
-            return False
+            async with httpx.AsyncClient(http2=True, proxy=proxy_str, timeout=8) as client:
+                for url in date_sources:
+                    try:
+                        resp = await client.head(url)
+                        header = resp.headers.get("Date")
+                        if not header:
+                            continue
+                        dt = parsedate_to_datetime(header)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        remote_ts = dt.timestamp()
+                        if remote_ts > 0:
+                            break
+                    except (httpx.HTTPError, ValueError, TypeError, OverflowError) as e:
+                        logger.debug(f"世界时间源 {url} 不可用: {e}")
+                if not remote_ts:
+                    for url in numeric_sources:
+                        try:
+                            resp = await client.get(url)
+                            raw = (resp.content or b"").decode(errors="ignore").strip()
+                            if not raw.isdigit():
+                                logger.debug(f"世界时间接口 {url} 返回非时间戳内容, 已跳过.")
+                                continue
+                            value = int(raw)
+                            remote_ts = value / 1000 if value > 1e11 else float(value)
+                            break
+                        except (httpx.HTTPError, ValueError, TypeError, OverflowError) as e:
+                            logger.debug(f"世界时间接口 {url} 不可用: {e}")
         except Exception as e:
-            logger.warning(f"检测世界时间发生错误, 时间检测将被跳过.")
-            show_exception(e)
+            logger.debug(f"检测世界时间时发生错误: {e}")
+
+        if not remote_ts:
+            logger.warning("无法获取世界时间, 系统时间检测将跳过, 敬请注意. 程序将继续运行.")
             return False
+
+        drift = datetime.now(timezone.utc).timestamp() - remote_ts
+        if abs(drift) > 30:
+            logger.warning(
+                f"您的系统时间设置不正确, 与世界时间相差约 {drift:+.0f} 秒, "
+                f"可能导致 Telegram 登录失败, 请在宿主机上启用 NTP 校时. 程序将继续运行."
+            )
+            return False
+        return True
 
     async def get_session_str_from_telethon(self, account: TelegramAccount):
         from telethon import TelegramClient
