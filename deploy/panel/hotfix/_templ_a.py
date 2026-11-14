@@ -98,6 +98,17 @@ def _match_button(answer: str, buttons: List[str]) -> Optional[str]:
     return None
 
 
+def _looks_like_quiz_prompt(text: str) -> bool:
+    """判断点击签到按钮后的 callback answer 是「去做验证」的中间提示, 而非签到结果.
+
+    基类把「完成」也列为成功关键词, 像「请先完成签到验证」这样的 toast 会被
+    误判为签到成功并提前结束, 导致随后发来的验证题消息再也收不到.
+    """
+    hints = ("验证", "请选择", "请先", "答对", "答题", "题目")
+    results = ("成功", "获得", "猫币", "积分", "已签到", "签到日期", "已完成签到")
+    return any(h in text for h in hints) and not any(r in text for r in results)
+
+
 class TemplateACheckinConfig(BaseModel):
     # fmt: off
     name: Optional[str] = None  # 签到器的名称
@@ -237,16 +248,15 @@ class TemplateACheckin(BotCheckin):
         if self.templ_quiz_enabled and await self._handle_quiz(message):
             return
         text = message.caption or message.text
-        if (
-            text
-            and message.reply_markup
-            and (
-                (
-                    self.templ_panel_keywords
-                    and any(keyword in text for keyword in to_iterable(self.templ_panel_keywords))
-                )
-                or (getattr(message, "is_first_response", False) and not message.edit_date)
+        # 首条响应可能是无 caption 的图片 (面板按钮才是关键), 不要求必须有文本;
+        # templ_panel_keywords 分支仍需要文本才能匹配.
+        if message.reply_markup and (
+            (
+                text
+                and self.templ_panel_keywords
+                and any(keyword in text for keyword in to_iterable(self.templ_panel_keywords))
             )
+            or (getattr(message, "is_first_response", False) and not message.edit_date)
         ):
             keys = [k.text for r in message.reply_markup.inline_keyboard for k in r]
             for k in keys:
@@ -288,6 +298,9 @@ class TemplateACheckin(BotCheckin):
                 self.log.warning(f"签到失败: 签到按钮指向 URL, 不受支持.")
                 return await self.fail()
             if answer.message and not any(ignore in answer.message for ignore in self.bot_text_ignore_answer):
+                if self.templ_quiz_enabled and _looks_like_quiz_prompt(answer.message):
+                    self.log.debug(f"忽略签到按钮的中间提示: {answer.message}")
+                    return
                 await self.on_text(Message(id=0, text=answer.message), answer.message)
 
 
