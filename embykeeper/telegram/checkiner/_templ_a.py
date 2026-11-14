@@ -1,18 +1,101 @@
 import asyncio
 import random
+import re
 from typing import List, Optional, Union
 
 from loguru import logger
 from pydantic import BaseModel, ValidationError
-from pyrogram.types import Message
+from pyrogram.types import InlineKeyboardMarkup, Message
 from pyrogram.errors import MessageIdInvalid
 from pyrogram.raw.types.messages import BotCallbackAnswer
 
 from embykeeper.utils import to_iterable
 
 from . import BotCheckin
+from ._base import default_keywords
 
 __ignore__ = True
+
+# 「签到验证」类选择题的默认识别关键词, 必须同时带有 inline 按钮才会被判定为验证题.
+DEFAULT_QUIZ_KEYWORDS = (
+    "签到验证",
+    "请选择正确答案",
+    "请选择正确",
+    "人机验证",
+    "答对后完成签到",
+    "只能选择一次",
+    "计算出",
+    "题目",
+)
+
+# 兼容 Unicode 数学符号 (U+2212 减号 / 全角) 以及 = ? 之间的空白.
+_QUIZ_MATH_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*([+\-−–—﹣－＋×✕✖xX*÷/])\s*(-?\d+(?:\.\d+)?)\s*[=＝]\s*[?？]"
+)
+
+_OPS = {
+    "+": "add",
+    "＋": "add",
+    "-": "sub",
+    "−": "sub",
+    "–": "sub",
+    "—": "sub",
+    "﹣": "sub",
+    "－": "sub",
+    "*": "mul",
+    "×": "mul",
+    "✕": "mul",
+    "✖": "mul",
+    "x": "mul",
+    "X": "mul",
+    "/": "div",
+    "÷": "div",
+}
+
+
+def _solve_math(text: str) -> Optional[str]:
+    """从题面解析 a op b = ? 并以字符串返回答案, 无法解析或结果异常时返回 None."""
+    match = _QUIZ_MATH_RE.search(text)
+    if not match:
+        return None
+    op = _OPS.get(match.group(2))
+    if not op:
+        return None
+    try:
+        a, b = float(match.group(1)), float(match.group(3))
+    except ValueError:
+        return None
+    if abs(a) > 1e6 or abs(b) > 1e6:
+        return None
+    if op == "add":
+        value = a + b
+    elif op == "sub":
+        value = a - b
+    elif op == "mul":
+        value = a * b
+    else:
+        if b == 0:
+            return None
+        value = a / b
+    if abs(value) > 1e9:
+        return None
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _match_button(answer: str, buttons: List[str]) -> Optional[str]:
+    """把答案匹配到按钮文字, 支持 "A. 1" 这类带前缀的选项."""
+    for button in buttons:
+        if button and button.strip() == answer:
+            return button
+    for button in buttons:
+        if not button:
+            continue
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", button)
+        if len(numbers) == 1 and numbers[0] == answer:
+            return button
+    return None
 
 
 class TemplateACheckinConfig(BaseModel):
@@ -30,6 +113,10 @@ class TemplateACheckinConfig(BaseModel):
     bot_use_captcha: Optional[bool] = None  # 当 Bot 返回图片时, 识别验证码并调用 on_captcha
     bot_checkin_button: Union[str, List[str]] = None  # 签到按钮文本
     templ_panel_keywords: Union[str, List[str]] = None  # 面板关键词
+    templ_quiz_enabled: Optional[bool] = None  # 自动回答「签到验证」选择题, 置空默认开启
+    templ_quiz_keywords: Union[str, List[str]] = None  # 验证题识别关键词, 置空使用内置关键词表
+    templ_quiz_local_math: Optional[bool] = None  # 纯算术题本地计算, 不消耗模型额度, 置空默认开启
+    templ_quiz_use_gpt: Optional[bool] = None  # 本地算不出时调用智能模型, 置空默认开启
     # fmt: on
 
 
@@ -39,6 +126,10 @@ class TemplateACheckin(BotCheckin):
     bot_checkin_cmd = "/start"
     bot_checkin_button = ["签到", "簽到"]
     templ_panel_keywords = None
+    templ_quiz_enabled = True
+    templ_quiz_keywords = None
+    templ_quiz_local_math = True
+    templ_quiz_use_gpt = True
 
     async def init(self):
         try:
@@ -68,11 +159,83 @@ class TemplateACheckin(BotCheckin):
             if self.t_config.bot_use_captcha is not None
             else self.bot_use_captcha
         )
+        self.templ_quiz_enabled = (
+            self.t_config.templ_quiz_enabled
+            if self.t_config.templ_quiz_enabled is not None
+            else self.templ_quiz_enabled
+        )
+        self.templ_quiz_keywords = self.t_config.templ_quiz_keywords or self.templ_quiz_keywords
+        self.templ_quiz_local_math = (
+            self.t_config.templ_quiz_local_math
+            if self.t_config.templ_quiz_local_math is not None
+            else self.templ_quiz_local_math
+        )
+        self.templ_quiz_use_gpt = (
+            self.t_config.templ_quiz_use_gpt
+            if self.t_config.templ_quiz_use_gpt is not None
+            else self.templ_quiz_use_gpt
+        )
+        self._quiz_handled = set()
 
         self.log = logger.bind(scheme="telechecker", name=self.name, username=self.client.me.full_name)
         return True
 
+    async def _handle_quiz(self, message: Message) -> bool:
+        """处理「签到验证」选择题, 返回 True 表示该消息已被消费, 不再交给基类."""
+        text = message.text or message.caption
+        if not text:
+            return False
+        markup = getattr(message, "reply_markup", None)
+        if not isinstance(markup, InlineKeyboardMarkup) or not markup.inline_keyboard:
+            return False
+        keywords = to_iterable(self.templ_quiz_keywords) or DEFAULT_QUIZ_KEYWORDS
+        if not any(keyword in text for keyword in keywords):
+            return False
+        # 「完成」等成功关键词也会出现在题面里 (例如「答对后完成签到」),
+        # 因此仅在不含问号时才把消息视为机器人给出的结果.
+        result_keywords = to_iterable(self.bot_success_keywords) or default_keywords["success"]
+        if not any(mark in text for mark in ("?", "？")) and any(k in text for k in result_keywords):
+            return False
+
+        handled = getattr(self, "_quiz_handled", None)
+        if handled is None:
+            handled = self._quiz_handled = set()
+        key = (getattr(message, "id", None), text)
+        if key in handled:
+            return True
+        handled.add(key)
+        if len(handled) > 128:
+            handled.clear()
+            handled.add(key)
+
+        buttons = [k.text for r in markup.inline_keyboard for k in r if k and k.text]
+        if not buttons:
+            return False
+
+        answer = _solve_math(text) if self.templ_quiz_local_math else None
+        if answer:
+            button = _match_button(answer, buttons)
+            if button:
+                self.log.info(f'签到验证: 本地计算答案 "{answer}", 点击按钮 "{button}".')
+                try:
+                    await message.click(button)
+                except (TimeoutError, MessageIdInvalid):
+                    pass
+                return True
+            self.log.debug(f'签到验证: 本地计算答案 "{answer}" 未在按钮中找到对应选项.')
+
+        if self.templ_quiz_use_gpt:
+            self.log.info("签到验证: 正在使用智能接口回答问题.")
+            if not await self.gpt_handle_message(message, unexpected=False):
+                self.log.warning("签到验证: 智能回答未成功, 签到器将继续等待机器人响应.")
+            return True
+
+        self.log.warning("签到验证: 未启用智能回答, 该题目将被跳过.")
+        return True
+
     async def message_handler(self, client, message: Message):
+        if self.templ_quiz_enabled and await self._handle_quiz(message):
+            return
         text = message.caption or message.text
         if (
             text
@@ -107,6 +270,17 @@ class TemplateACheckin(BotCheckin):
             return await self.fail()
 
         await super().message_handler(client, message)
+
+    async def on_text(self, message: Message, text: str):
+        # 基类把「只能」视作「今日已签到」, 而验证题常写「每题只能选择一次」;
+        # 这类题目已由 _handle_quiz 消费, 这里再兜住 callback answer 构造的伪消息.
+        if (
+            self.templ_quiz_enabled
+            and text
+            and any(k in text for k in ("只能选择一次", "请选择正确答案", "答对后完成签到"))
+        ):
+            return
+        await super().on_text(message, text)
 
     async def on_button_answer(self, answer: BotCallbackAnswer):
         if self.use_button_answer:

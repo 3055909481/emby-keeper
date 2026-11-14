@@ -2,13 +2,14 @@
 # =============================================================================
 # embykeeper 8.1.1 面板模式「单容器后台服务 + 离线自足」补丁
 #
-# 一次装齐 6 个文件 (容器内路径相对 embykeeper 包目录):
-#   panel_scheduler_init.py -> api/__init__.py          API 进程内启动计划任务
-#   api_config.py           -> api/config.py            面板「AI 与验证码服务」设置端点
-#   link.py                 -> telegram/link.py         取消云端认证 / 能力本地化
-#   capability.py           -> telegram/capability.py   本地模型 / 验证码服务提供者
-#   capability_settings.py  -> capability_settings.py   面板配置读写 (/app/capability.json)
-#   session.py              -> telegram/session.py      世界时间检测多源容错
+# 一次装齐 7 个文件 (容器内路径相对 embykeeper 包目录):
+#   panel_scheduler_init.py -> api/__init__.py                     API 进程内启动计划任务
+#   api_config.py           -> api/config.py                       面板「AI 与验证码服务」设置端点
+#   link.py                 -> telegram/link.py                    取消云端认证 / 能力本地化
+#   capability.py           -> telegram/capability.py              本地模型 / 验证码服务提供者
+#   capability_settings.py  -> capability_settings.py              面板配置读写 (/app/capability.json)
+#   session.py              -> telegram/session.py                 世界时间检测多源容错
+#   _templ_a.py             -> telegram/checkiner/_templ_a.py     templ_a 自定义站点「签到验证」自动答题
 #
 # 重要: capability.py 会 import capability_settings.py, 这些文件必须同时安装,
 #       否则容器启动时抛 ModuleNotFoundError. 本脚本因此采用批量安装 + 整体回滚.
@@ -16,7 +17,7 @@
 # 注意: 本脚本只替换容器内的 Python 源码; 新增的 Web 配置页属于已构建的前端
 #       静态资源, 只能通过使用 CI 构建的新镜像获得 (Build Docker Image Artifact).
 #
-# 用法 (在 Docker 宿主机上执行, 6 个 .py 文件与脚本放同一目录):
+# 用法 (在 Docker 宿主机上执行, 7 个 .py 文件与脚本放同一目录):
 #   bash apply_patch.sh                # 自动查找面板容器并打补丁
 #   bash apply_patch.sh <容器名或ID>    # 明确指定容器
 #   bash apply_patch.sh --rollback [容器名或ID]
@@ -34,6 +35,7 @@ PATCH_MAP=(
   "capability.py|telegram/capability.py"
   "capability_settings.py|capability_settings.py"
   "session.py|telegram/session.py"
+  "_templ_a.py|telegram/checkiner/_templ_a.py"
 )
 BACKUP_DIR="$SCRIPT_DIR/.panel-patch-backup"
 
@@ -135,7 +137,7 @@ done
 echo "   宿主机备份目录: $BACKUP_DIR"
 
 # --- 5. 覆盖全部补丁 ---------------------------------------------------------
-info "写入 6 个补丁文件"
+info "写入 7 个补丁文件"
 for entry in "${PATCH_MAP[@]}"; do
     src="${entry%%|*}"; rel="${entry#*|}"
     docker cp "$SCRIPT_DIR/$src" "$CONTAINER:$PKG_DIR/$rel" >/dev/null
@@ -161,7 +163,7 @@ then
 fi
 
 if ! docker exec "$CONTAINER" python -c \
-    'import embykeeper.capability_settings, embykeeper.telegram.link, embykeeper.telegram.capability; print("  import OK")'; then
+    'import embykeeper.capability_settings, embykeeper.telegram.link, embykeeper.telegram.capability, embykeeper.telegram.checkiner._templ_a; print("  import OK")'; then
     echo "导入校验失败, 正在整体回滚..." >&2
     restore_all
     die "补丁未生效, 已恢复全部原文件"
@@ -208,6 +210,12 @@ cat <<EOF
     EK_CAPTCHA_API_URL / EK_CAPTCHA_API_KEY                  Turnstile 验证码求解
   OCR 已使用镜像自带的 ddddocr, 无需额外配置.
   若 Auth Bot 恢复且想回到上游严格认证: EK_LINK_STRICT_AUTH=1
+
+本次补丁还让 templ_a 自定义站点能自动回答「签到验证」选择题:
+  纯算术题 (例如 "6 − 5 = ?") 直接本地计算并点击对应按钮, 不消耗模型额度;
+  其他题目走已配置的智能模型, 答完继续等待签到结果 (不再答完即判失败).
+  面板「自定义站点」里可调: templ_quiz_enabled / templ_quiz_keywords /
+  templ_quiz_local_math / templ_quiz_use_gpt.
 
 验证:
   docker logs --tail 80 $CNAME

@@ -628,8 +628,10 @@ class CapabilitySettingsPayload(BaseModel):
     llm_enabled: bool = True
     llm_base_url: str = ""
     llm_api_key: str = ""
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-5.6-terra"
     llm_vision_model: str = ""
+    llm_reasoning_effort: str = ""
+    llm_fallback_model: str = ""
     llm_proxy: str = ""
     llm_timeout: float = Field(40.0, gt=0)
     captcha_enabled: bool = True
@@ -639,8 +641,27 @@ class CapabilitySettingsPayload(BaseModel):
     captcha_timeout: float = Field(60.0, gt=0)
 
 
+def _test_png(size: int = 16) -> bytes:
+    """生成纯红色 PNG, 用于验证多模态通道 (只用标准库, 不引入新依赖)."""
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + bytes((220, 40, 40)) * size
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * size))
+        + chunk(b"IEND", b"")
+    )
+
+
 class CapabilityTestPayload(BaseModel):
-    target: str = Field("llm", pattern="^(llm|captcha)$")
+    target: str = Field("llm", pattern="^(llm|llm_vision|captcha)$")
 
 
 @router.get("/settings/capability")
@@ -675,7 +696,23 @@ async def test_capability(payload: CapabilityTestPayload):
             return {
                 "success": bool(answer),
                 "detail": (
-                    f"{by}: {str(answer)[:120]}" if answer else "模型无响应, 请检查地址 / 密钥 / 模型名"
+                    f"{by}: {str(answer)[:120]}"
+                    if answer
+                    else "模型无响应或服务端错误, 请查看运行日志中的网关响应正文 (常见为中转渠道不可用)"
+                ),
+            }
+        if payload.target == "llm_vision":
+            if not provider.llm_enabled:
+                return {"success": False, "detail": "尚未填写模型服务地址"}
+            answer, by = await provider.chat(
+                "这张图片的主色是什么? 只回复颜色名称.", image=_test_png(), vision=True
+            )
+            return {
+                "success": bool(answer),
+                "detail": (
+                    f"{by}: {str(answer)[:120]}"
+                    if answer
+                    else "视觉模型无响应或服务端错误, 请查看日志 (可能是该模型不支持图片输入)"
                 ),
             }
         if not provider.captcha_enabled:

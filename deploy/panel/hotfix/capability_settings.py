@@ -27,6 +27,8 @@ ENV_KEYS = {
     "llm_api_key": "EK_LLM_API_KEY",
     "llm_model": "EK_LLM_MODEL",
     "llm_vision_model": "EK_LLM_VISION_MODEL",
+    "llm_reasoning_effort": "EK_LLM_REASONING_EFFORT",
+    "llm_fallback_model": "EK_LLM_FALLBACK_MODEL",
     "llm_proxy": "EK_LLM_PROXY",
     "llm_timeout": "EK_LLM_TIMEOUT",
     "captcha_api_url": "EK_CAPTCHA_API_URL",
@@ -43,8 +45,12 @@ class CapabilitySettings(BaseModel):
     llm_enabled: bool = True
     llm_base_url: str = ""
     llm_api_key: str = ""
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-5.6-terra"
     llm_vision_model: str = ""
+    # 空字符串表示不发送 reasoning_effort 参数, 兼容不支持该字段的端点
+    llm_reasoning_effort: str = ""
+    # 主模型失败或返回空内容时重试一次的备用模型
+    llm_fallback_model: str = ""
     llm_proxy: str = ""
     llm_timeout: float = Field(40.0, gt=0)
     captcha_enabled: bool = True
