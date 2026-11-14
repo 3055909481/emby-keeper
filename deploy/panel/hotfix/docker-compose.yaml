@@ -1,0 +1,40 @@
+# Embykeeper 8.1.1 面板模式「单容器 + 单进程」修复版编排
+#
+# 架构: 浏览器 -> 面板 8000 (embykeeperapi + 前端)
+#                    -> 容器内 127.0.0.1:8001 业务后端
+#                         -> FastAPI REST 接口  (面板读写 config.toml / TG 登录)
+#                         -> 同一进程内的计划任务 (签到 / 保活 / 监控 / 水群)
+#
+# 上游 8.1.1 的 cli.py 在 --api 分支直接 return, 跳过了全部 schedule_all(),
+# 所以面板后端只提供接口不跑任务. 本编排使用 apply_patch.sh 固化的补丁镜像,
+# 在 API lifespan 中启动调度; 面板保存配置会强制 config.reload_conf() 并触发
+# 各 Manager 的 on_list_change 回调, 账号增删/计划时间修改即时生效.
+#
+# 使用:
+#   1) 已有部署: bash apply_patch.sh            # 就地打补丁并生成补丁镜像
+#   2) 从零部署: 同目录建 .env (面板密码变量沿用原部署), 然后 docker compose up -d
+#      镜像名默认 embykeeper/embykeeper:panel-scheduler, 可用 EMBYKEEPER_IMAGE 覆盖
+#
+# 注意: 若已有同名容器在运行, 先 docker rm -f embykeeper-panel (数据卷不会丢)
+
+services:
+  embykeeper:
+    image: ${EMBYKEEPER_IMAGE:-embykeeper/embykeeper:panel-scheduler}
+    container_name: embykeeper-panel
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - '8000:8000'
+    # 原样继承 .env, 不改写变量名, 兼容文档与源码对面板密码变量名的差异
+    env_file: .env
+    environment:
+      # 可选: 启动后立刻跑一次签到/保活 (等价命令行 -i)
+      EK_PANEL_INSTANT: ${EK_PANEL_INSTANT:-0}
+      # 可选: 需要启用的模块, 加 registrar 可启用自动注册; none = 退回纯 API
+      EK_PANEL_TASKS: ${EK_PANEL_TASKS:-checkiner,monitor,messager,emby,subsonic}
+      # 可选: 通知推送 (需要可用的 Telegram 账号)
+      EK_PANEL_NOTIFIER: ${EK_PANEL_NOTIFIER:-0}
+    volumes:
+      - ./data:/app
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'

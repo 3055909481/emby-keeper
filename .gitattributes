@@ -1,4 +1,6 @@
 * text=auto
+*.sh text eol=lf
+*.py text eol=lf
 *.bat eol=crlf
 *.nsi linguist-vendored
 *.nsh linguist-vendored
