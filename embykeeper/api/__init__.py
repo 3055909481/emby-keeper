@@ -25,7 +25,8 @@ Manager 拉起全部计划任务; 在服务器关闭时一并取消. 其余代�
 
 可选环境变量 (都是可选项, 不配置即使用安全默认值):
     EK_PANEL_TASKS    逗号分隔, 默认 "checkiner,emby,subsonic"
-                      可加 registrar; 设为 "none" 则退化为纯 API 模式
+                      可加 monitor / messager / registrar (认证门禁已默认放行,
+                      详见 telegram/link.py); 设为 "none" 则退化为纯 API 模式
     EK_PANEL_INSTANT  1/true/yes 时后端启动后立刻跑一次签到与保活 (等价 CLI -i)
     EK_PANEL_NOTIFIER 1/true/yes 时同时启用通知推送 (需要可用的 Telegram 账号)
 """
@@ -42,7 +43,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from .. import __version__
-
 
 _DEFAULT_TASKS = "checkiner,emby,subsonic"
 
@@ -81,9 +81,7 @@ async def _start_schedulers():
     await _ensure_config_observer()
 
     wanted = {
-        item.strip()
-        for item in os.environ.get("EK_PANEL_TASKS", _DEFAULT_TASKS).split(",")
-        if item.strip()
+        item.strip() for item in os.environ.get("EK_PANEL_TASKS", _DEFAULT_TASKS).split(",") if item.strip()
     }
     if "none" in wanted:
         wanted.clear()
@@ -103,9 +101,7 @@ async def _start_schedulers():
             logger.warning(f"计划任务 {name} 启动失败, 已跳过 (API 服务不受影响): {exc}")
 
     if tasks:
-        logger.info(
-            "面板模式后台服务已就绪: 面板中配置的 Telegram / Emby 账号将自动执行签到与保活."
-        )
+        logger.info("面板模式后台服务已就绪: 面板中配置的 Telegram / Emby 账号将自动执行签到与保活.")
     else:
         logger.warning("面板模式未启用任何计划任务, 当前仅提供 REST API.")
 
@@ -115,9 +111,7 @@ async def _start_schedulers():
             if manager is None:
                 continue
             try:
-                asyncio.create_task(
-                    manager.run_all(instant=True), name=f"panel-instant-{name}"
-                )
+                asyncio.create_task(manager.run_all(instant=True), name=f"panel-instant-{name}")
                 logger.info(f"启动后立即执行一次: {name}")
             except Exception as exc:
                 logger.warning(f"立即执行 {name} 失败: {exc}")

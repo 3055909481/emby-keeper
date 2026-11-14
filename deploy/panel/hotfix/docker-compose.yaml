@@ -34,6 +34,17 @@ services:
       EK_PANEL_TASKS: ${EK_PANEL_TASKS:-checkiner,emby,subsonic}
       # 可选: 通知推送 (需要可用的 Telegram 账号)
       EK_PANEL_NOTIFIER: ${EK_PANEL_NOTIFIER:-0}
+      # --- 本地 / 自建能力 (也可直接写进 .env, 由 env_file 原样继承) ---
+      # 默认不再访问作者的 @embykeeper_auth_bot, 认证一律放行;
+      # 下面这些不配置时, 依赖对应能力的站点会快速跳过而不是卡满超时;
+      # 图片 OCR 已使用镜像自带的 ddddocr, 无需配置.
+      # EK_LLM_BASE_URL: https://api.openai.com/v1
+      # EK_LLM_API_KEY: sk-xxx
+      # EK_LLM_MODEL: gpt-4o-mini
+      # EK_LLM_VISION_MODEL: gpt-4o-mini
+      # EK_CAPTCHA_API_URL: http://your-solver/solve
+      # EK_CAPTCHA_API_KEY: xxx
+      # Auth Bot 恢复且要回到上游严格认证时: EK_LINK_STRICT_AUTH: "1"
     volumes:
       - ./data:/app
     extra_hosts:

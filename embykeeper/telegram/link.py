@@ -19,6 +19,7 @@ from embykeeper.utils import async_partial, truncate_str
 
 from .lock import super_ad_shown, super_ad_shown_lock, authed_services, authed_services_lock
 from .pyrogram import Client
+from .capability import ANSWER_SYSTEM, INFER_SYSTEM, provider
 
 # 云端认证等待; 上游默认 60s x 3, Auth Bot 失效时会把登录/签到流程拖死
 try:
@@ -26,7 +27,10 @@ try:
     _AUTH_RETRIES = max(1, int(os.environ.get("EK_LINK_AUTH_RETRIES", "2")))
 except ValueError:
     _AUTH_TIMEOUT, _AUTH_RETRIES = 15.0, 2
-# 设为 1 恢复上游严格行为 (认证失败即跳过模块)
+# 默认「离线自足模式」: 不向 @embykeeper_auth_bot 发任何请求.
+#   - auth() 直接放行 (默认视作高级用户)
+#   - 云端能力改由 .capability 的本地 / 自建 provider 提供, 未配置则快速失败
+# EK_LINK_STRICT_AUTH=1 恢复上游的云端认证与云端能力, 用于 Auth Bot 仍可用的环境.
 _STRICT_AUTH = os.environ.get("EK_LINK_STRICT_AUTH", "").strip().lower() in ("1", "true", "yes")
 
 
@@ -78,6 +82,10 @@ class Link:
         return await asyncio.gather(*[delete(m) for m in messages])
 
     async def post(self, *args, stop_grace: float = 0, **kw):
+        if not _STRICT_AUTH:
+            self.log.debug("[gray50]离线模式: 跳过对 Auth Bot 的云端请求[/]")
+            return None
+
         async def stop(task: asyncio.Task):
             if stop_grace and not task.done():
                 await asyncio.sleep(stop_grace)
@@ -252,27 +260,27 @@ class Link:
                 message.continue_propagation()
 
     async def auth(self, service: str, log_func=None):
-        """向机器人发送授权请求.
+        """权限校验 (默认直接放行).
 
-        Auth Bot 是作者运营的云端服务, 不可达时上游会让整个签到/监控模块直接
-        return, 连本地本不需要云端能力的功能也被阻断. 这里改为:
-        - 缩短认证等待, 超时后进入熔断窗口, 后续云端请求快速失败;
-        - 区分 "超时" (服务不可达) 与 "权限不足" (明确拒绝), 前者按离线模式放行;
-        - EK_LINK_STRICT_AUTH=1 可恢复上游的严格行为.
+        上游把 ``/auth <service>`` 发给作者运营的 @embykeeper_auth_bot, 该 Bot
+        只做赞助等级校验: prime / super / pornemby_pack / captcha / ocr / visual /
+        gpt 都是「权限标记」, 不是能力本身 —— 站点真正的能力调用是另外的
+        Link.captcha() / Link.ocr() / Link.gpt() 等. 因此认证与功能实现无关.
+
+        但 checkin_main / monitor_main / message_main 都有
+        ``if not await Link(client).auth(...): return``, Bot 停服时整个模块被跳过.
+        默认改为零网络请求直接放行 (视作高级用户); EK_LINK_STRICT_AUTH=1 恢复云端认证.
         """
+        if not _STRICT_AUTH:
+            self.log.debug(f"[gray50]离线模式: 跳过服务 {service.upper()} 认证 (默认高级用户)[/]")
+            return True
+
         async with authed_services_lock:
-            user_auth_cache = authed_services.get(self.client.me.id, {}).get(service, None)
-            if user_auth_cache is not None:
-                return user_auth_cache
-
-            def finish(allowed: bool, message: str = None):
-                authed_services.setdefault(self.client.me.id, {})[service] = allowed
-                if message:
-                    (log_func or self.log.warning)(message)
-                return allowed
-
+            cached = authed_services.get(self.client.me.id, {}).get(service)
+            if cached is not None:
+                return cached
             try:
-                result = await self.post(
+                await self.post(
                     f"/auth {service} {self.instance}",
                     name=f"服务 {service.upper()} 认证",
                     timeout=_AUTH_TIMEOUT,
@@ -280,20 +288,16 @@ class Link:
                     fail=True,
                 )
             except LinkError as e:
-                errmsg = str(e)
-                if "超时" in errmsg and not _STRICT_AUTH:
-                    return finish(
-                        True,
-                        f"账号服务 {service.upper()} 认证无响应, 已切换离线模式: "
-                        f"本地功能继续运行, 依赖云端解析的站点将自动跳过.",
-                    )
-                if "权限不足" in errmsg:
+                if log_func:
+                    log_func(f"初始化错误: 使用 {service.upper()} 服务, 但{e}")
+                if "权限不足" in str(e):
                     await self._show_super_ad()
-                return finish(False, f"初始化错误: 使用 {service.upper()} 服务, 但{errmsg}")
+                authed_services.setdefault(self.client.me.id, {})[service] = False
+                return False
             else:
-                if not result and Link.is_offline() and not _STRICT_AUTH:
-                    return finish(True, f"账号服务不可用, 服务 {service.upper()} 认证已跳过 (离线模式).")
-                return finish(bool(result))
+                self.log.info(f"服务请求完成: 服务 {service.upper()} 认证")
+                authed_services.setdefault(self.client.me.id, {})[service] = True
+                return True
 
     async def _show_super_ad(self):
         async with super_ad_shown_lock:
@@ -305,117 +309,162 @@ class Link:
             else:
                 return False
 
+    async def _download(self, photo) -> Optional[bytes]:
+        """把 Telegram 图片 (file_id / Message) 下载成字节, 供本地 OCR / 视觉模型使用."""
+        try:
+            data = await self.client.download_media(photo, in_memory=True)
+            if data:
+                return data.getvalue() if hasattr(data, "getvalue") else bytes(data)
+        except Exception as e:
+            self.log.debug(f"下载图片失败: {e}")
+        return None
+
+    async def _local_ocr(self, photo) -> Optional[str]:
+        """用项目自带的 ddddocr 离线识别验证码 (镜像已带 ddddocrfix + libgomp1)."""
+        data = await self._download(photo)
+        if not data:
+            return None
+        try:
+            from embykeeper.ocr import OCRService
+
+            service = await OCRService.get()
+            with service:
+                return (await service.run(BytesIO(data), timeout=30)) or None
+        except Exception as e:
+            self.log.debug(f"本地 OCR 失败: {e}")
+            return None
+
     async def captcha(self, site: str, url: str = None) -> Optional[str]:
-        """向机器人发送验证码解析请求."""
+        """获取 Turnstile / hCaptcha token."""
+        if not _STRICT_AUTH:
+            token = await provider.solve_captcha(site, url, kind="token")
+            if not token:
+                self.log.debug(f"[gray50]未配置验证码求解服务, 站点 {site} 将跳过[/]")
+            return token
         cmd = f"/captcha {self.instance} {site}"
         if url:
             cmd += f" {url}"
         results = await self.post(cmd, timeout=120, name="请求跳过验证码")
-        if results:
-            return results.get("token", None)
-        else:
-            return None
+        return results.get("token") if results else None
 
     async def captcha_content(self, site: str, url: str = None) -> Optional[str]:
-        """向机器人发送带验证码的远程网页解析请求."""
+        """获取带验证码的远程网页解析结果."""
+        if not _STRICT_AUTH:
+            return await provider.solve_captcha(site, url, kind="content")
         cmd = f"/captcha {self.instance} {site}"
         if url:
             cmd += f" {url}"
         results = await self.post(cmd, timeout=120, name="请求跳过验证码")
-        if results:
-            return results.get("content", None)
-        else:
-            return None
+        return results.get("content") if results else None
 
     async def wssocks(self) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送逆向 Socks 代理隧道监听请求."""
-        cmd = f"/wssocks {self.instance}"
-        results = await self.post(cmd, timeout=20, name="请求新建代理隧道以跳过验证码")
-        if results:
-            return results.get("url", None), results.get("token", None)
-        else:
+        """申请反向代理隧道 (服务端由作者提供, 离线模式无替代)."""
+        if not _STRICT_AUTH:
+            self.log.debug("[gray50]离线模式: 反向代理隧道服务不可用[/]")
             return None, None
+        results = await self.post(
+            f"/wssocks {self.instance}", timeout=20, name="请求新建代理隧道以跳过验证码"
+        )
+        if results:
+            return results.get("url"), results.get("token")
+        return None, None
 
     async def captcha_wssocks(
         self, token: str, url: str, user_agent: Optional[str] = None
     ) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送通过代理隧道进行验证码解析请求."""
+        """通过反向隧道解析 Cloudflare clearance (离线模式无替代)."""
+        if not _STRICT_AUTH:
+            return None, None
         cmd = f"/captcha_wssocks {self.instance} {token} {url}"
         if user_agent:
             cmd += f" {user_agent}"
         results = await self.post(cmd, timeout=120, name="请求跳过验证码")
         if results:
-            return results.get("cf_clearance", None), results.get("useragent", None)
-        else:
-            return None, None
+            return results.get("cf_clearance"), results.get("useragent")
+        return None, None
 
     async def pornemby_answer(self, question: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送问题回答请求."""
+        """题库问答."""
+        if not _STRICT_AUTH:
+            return await provider.chat(question, system=ANSWER_SYSTEM)
         results = await self.post(
             f"/pornemby_answer {self.instance} {question}", timeout=20, name="请求问题回答"
         )
         if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+            return results.get("answer"), results.get("by")
+        return None, None
 
     async def terminus_answer(self, question: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送问题回答请求."""
+        """终点站考试问答."""
+        if not _STRICT_AUTH:
+            return await provider.chat(question, system=ANSWER_SYSTEM)
         results = await self.post(
             f"/terminus_answer {self.instance} {question}", timeout=20, name="请求问题回答"
         )
         if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+            return results.get("answer"), results.get("by")
+        return None, None
 
     async def gpt(self, prompt: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送智能回答请求."""
+        """智能回答 / 话术生成."""
+        if not _STRICT_AUTH:
+            return await provider.chat(prompt, system=ANSWER_SYSTEM)
         results = await self.post(f"/gpt {self.instance} {prompt}", timeout=40, name="请求智能回答")
         if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+            return results.get("answer"), results.get("by")
+        return None, None
 
     async def visual(self, photo, options: List[str], question=None) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送视觉问题解答请求."""
+        """图片视觉问答 (离线模式走多模态模型)."""
+        if not _STRICT_AUTH:
+            data = await self._download(photo)
+            if not data:
+                return None, None
+            prompt = f"从以下选项中选择正确答案: {' / '.join(options)}"
+            if question:
+                prompt += f"\n问题: {question}"
+            prompt += "\n只输出选项内容, 不要解释."
+            return await provider.chat(prompt, image=data, vision=True, system=ANSWER_SYSTEM)
         cmd = f"/visual {self.instance} {'/'.join(options)}"
         if question:
             cmd += f" {question}"
         results = await self.post(cmd, photo=photo, timeout=20, name="请求视觉问题解答")
         if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+            return results.get("answer"), results.get("by")
+        return None, None
 
     async def ocr(self, photo) -> Optional[str]:
-        """向机器人发送 OCR 解答请求."""
-        cmd = f"/ocr {self.instance}"
-        results = await self.post(cmd, photo=photo, timeout=20, name="请求验证码解答")
-        if results:
-            return results.get("answer", None)
-        else:
-            return None
+        """图片验证码 OCR (离线模式走本地 ddddocr)."""
+        if not _STRICT_AUTH:
+            return await self._local_ocr(photo)
+        results = await self.post(f"/ocr {self.instance}", photo=photo, timeout=20, name="请求验证码解答")
+        return results.get("answer") if results else None
 
     async def send_log(self, message):
-        """向机器人发送日志记录请求."""
+        """远程日志推送; 离线模式静默丢弃, 返回 True 避免 TelegramLogger 反复告警."""
+        if not _STRICT_AUTH:
+            self.log.debug("[gray50]离线模式: 远程日志推送已禁用[/]")
+            return True
         results = await self.post(f"/log {self.instance} {message}", name="发送日志到 Telegram ")
         return bool(results)
 
     async def send_msg(self, message):
-        """向机器人发送即时日志记录请求."""
+        """即时远程日志推送; 离线模式静默丢弃."""
+        if not _STRICT_AUTH:
+            self.log.debug("[gray50]离线模式: 即时日志推送已禁用[/]")
+            return True
         results = await self.post(f"/msg {self.instance} {message}", name="发送即时日志到 Telegram ")
         return bool(results)
 
     async def infer(self, prompt: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送话术推测记录请求."""
+        """智能水群话术推测."""
+        if not _STRICT_AUTH:
+            return await provider.chat(prompt, system=INFER_SYSTEM)
         bio = BytesIO()
         bio.write(prompt.encode("utf-8"))
         bio.seek(0)
         bio.name = "data.txt"
-
         results = await self.post(f"/infer {self.instance}", timeout=120, file=bio, name="发送话术推测请求")
         if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+            return results.get("answer"), results.get("by")
+        return None, None
