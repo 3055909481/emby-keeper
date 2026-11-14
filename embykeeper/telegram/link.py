@@ -1,5 +1,7 @@
 import asyncio
+import os
 import random
+import time
 from typing import Callable, Coroutine, List, Optional, Tuple, Union
 import uuid
 from io import BytesIO
@@ -18,6 +20,15 @@ from embykeeper.utils import async_partial, truncate_str
 from .lock import super_ad_shown, super_ad_shown_lock, authed_services, authed_services_lock
 from .pyrogram import Client
 
+# 云端认证等待; 上游默认 60s x 3, Auth Bot 失效时会把登录/签到流程拖死
+try:
+    _AUTH_TIMEOUT = float(os.environ.get("EK_LINK_AUTH_TIMEOUT", "15"))
+    _AUTH_RETRIES = max(1, int(os.environ.get("EK_LINK_AUTH_RETRIES", "2")))
+except ValueError:
+    _AUTH_TIMEOUT, _AUTH_RETRIES = 15.0, 2
+# 设为 1 恢复上游严格行为 (认证失败即跳过模块)
+_STRICT_AUTH = os.environ.get("EK_LINK_STRICT_AUTH", "").strip().lower() in ("1", "true", "yes")
+
 
 class LinkError(Exception):
     pass
@@ -28,6 +39,18 @@ class Link:
 
     bot = "embykeeper_auth_bot"
     post_count = 0
+
+    # 确认 Auth Bot 无响应后进入熔断窗口, 期间云端请求直接跳过, 避免每个站点都卡满超时
+    _offline_until = 0.0
+    _offline_ttl = 300.0
+
+    @classmethod
+    def is_offline(cls):
+        return time.monotonic() < cls._offline_until
+
+    @classmethod
+    def _mark_offline(cls):
+        cls._offline_until = time.monotonic() + cls._offline_ttl
 
     def __init__(self, client: Client):
         self.client = client
@@ -95,6 +118,9 @@ class Link:
         """
         Link.post_count += 1
         try:
+            if Link.is_offline():
+                self.log.debug(f"[gray50]账号服务无响应, 跳过云端请求: {name}[/]")
+                return None
             self.log.info(f"正在进行服务请求: {name}")
 
             if photo and file:
@@ -146,6 +172,7 @@ class Link:
                         continue
                     else:
                         msg = f"{name}超时 ({r + 1}/{retries})."
+                        Link._mark_offline()
                         if fail:
                             raise LinkError(msg)
                         else:
@@ -225,35 +252,48 @@ class Link:
                 message.continue_propagation()
 
     async def auth(self, service: str, log_func=None):
-        """向机器人发送授权请求."""
+        """向机器人发送授权请求.
+
+        Auth Bot 是作者运营的云端服务, 不可达时上游会让整个签到/监控模块直接
+        return, 连本地本不需要云端能力的功能也被阻断. 这里改为:
+        - 缩短认证等待, 超时后进入熔断窗口, 后续云端请求快速失败;
+        - 区分 "超时" (服务不可达) 与 "权限不足" (明确拒绝), 前者按离线模式放行;
+        - EK_LINK_STRICT_AUTH=1 可恢复上游的严格行为.
+        """
         async with authed_services_lock:
             user_auth_cache = authed_services.get(self.client.me.id, {}).get(service, None)
             if user_auth_cache is not None:
                 return user_auth_cache
 
-            # No cache, perform auth
-            if not log_func:
+            def finish(allowed: bool, message: str = None):
+                authed_services.setdefault(self.client.me.id, {})[service] = allowed
+                if message:
+                    (log_func or self.log.warning)(message)
+                return allowed
+
+            try:
                 result = await self.post(
-                    f"/auth {service} {self.instance}", name=f"服务 {service.upper()} 认证"
+                    f"/auth {service} {self.instance}",
+                    name=f"服务 {service.upper()} 认证",
+                    timeout=_AUTH_TIMEOUT,
+                    retries=_AUTH_RETRIES,
+                    fail=True,
                 )
-                authed_services.setdefault(self.client.me.id, {})[service] = bool(result)
-                return bool(result)
-            else:
-                try:
-                    await self.post(
-                        f"/auth {service} {self.instance}",
-                        name=f"服务 {service.upper()} 认证",
-                        fail=True,
+            except LinkError as e:
+                errmsg = str(e)
+                if "超时" in errmsg and not _STRICT_AUTH:
+                    return finish(
+                        True,
+                        f"账号服务 {service.upper()} 认证无响应, 已切换离线模式: "
+                        f"本地功能继续运行, 依赖云端解析的站点将自动跳过.",
                     )
-                except LinkError as e:
-                    log_func(f"初始化错误: 使用 {service.upper()} 服务, 但{e}")
-                    if "权限不足" in str(e):
-                        await self._show_super_ad()
-                    authed_services.setdefault(self.client.me.id, {})[service] = False
-                    return False
-                else:
-                    authed_services.setdefault(self.client.me.id, {})[service] = True
-                    return True
+                if "权限不足" in errmsg:
+                    await self._show_super_ad()
+                return finish(False, f"初始化错误: 使用 {service.upper()} 服务, 但{errmsg}")
+            else:
+                if not result and Link.is_offline() and not _STRICT_AUTH:
+                    return finish(True, f"账号服务不可用, 服务 {service.upper()} 认证已跳过 (离线模式).")
+                return finish(bool(result))
 
     async def _show_super_ad(self):
         async with super_ad_shown_lock:

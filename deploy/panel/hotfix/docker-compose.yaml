@@ -31,7 +31,7 @@ services:
       # 可选: 启动后立刻跑一次签到/保活 (等价命令行 -i)
       EK_PANEL_INSTANT: ${EK_PANEL_INSTANT:-0}
       # 可选: 需要启用的模块, 加 registrar 可启用自动注册; none = 退回纯 API
-      EK_PANEL_TASKS: ${EK_PANEL_TASKS:-checkiner,monitor,messager,emby,subsonic}
+      EK_PANEL_TASKS: ${EK_PANEL_TASKS:-checkiner,emby,subsonic}
       # 可选: 通知推送 (需要可用的 Telegram 账号)
       EK_PANEL_NOTIFIER: ${EK_PANEL_NOTIFIER:-0}
     volumes:

@@ -24,7 +24,7 @@ Manager 拉起全部计划任务; 在服务器关闭时一并取消. 其余代�
       -> 任务运行状态写入 RunContext, 面板「运行状态」页与日志可直接查看
 
 可选环境变量 (都是可选项, 不配置即使用安全默认值):
-    EK_PANEL_TASKS    逗号分隔, 默认 "checkiner,monitor,messager,emby,subsonic"
+    EK_PANEL_TASKS    逗号分隔, 默认 "checkiner,emby,subsonic"
                       可加 registrar; 设为 "none" 则退化为纯 API 模式
     EK_PANEL_INSTANT  1/true/yes 时后端启动后立刻跑一次签到与保活 (等价 CLI -i)
     EK_PANEL_NOTIFIER 1/true/yes 时同时启用通知推送 (需要可用的 Telegram 账号)
@@ -44,7 +44,7 @@ from loguru import logger
 from .. import __version__
 
 
-_DEFAULT_TASKS = "checkiner,monitor,messager,emby,subsonic"
+_DEFAULT_TASKS = "checkiner,emby,subsonic"
 
 # (名称, 相对模块, 管理器类, 常驻入口方法) —— 与 cli.py 中的顺序/方法保持一致
 _TASK_SPECS = (
