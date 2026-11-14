@@ -13,6 +13,7 @@ import {
   ChartBarIcon,
   PuzzlePieceIcon,
   Cog6ToothIcon,
+  SparklesIcon,
   ArrowRightOnRectangleIcon
 } from '@heroicons/vue/24/outline'
 
@@ -28,6 +29,7 @@ const navigation = [
   { name: 'Subsonic 账号', href: '/subsonic', icon: MusicalNoteIcon },
   { name: '任务记录', href: '/runinfo', icon: ChartBarIcon },
   { name: '自定义站点', href: '/sites', icon: PuzzlePieceIcon },
+  { name: 'AI 与验证码', href: '/capability', icon: SparklesIcon },
   { name: '系统设置', href: '/settings', icon: Cog6ToothIcon },
 ]
 

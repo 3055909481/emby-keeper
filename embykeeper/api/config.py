@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, ValidationError
 from ..config import config as config_manager
 from ..schema import Config as CoreConfig, format_errors
 from ..utils import deep_update
+from .. import capability_settings
 
 router = APIRouter()
 
@@ -617,3 +618,72 @@ async def save_network_settings(payload: NetworkSettingsPayload):
         raise HTTPException(status_code=400, detail=format_errors(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存网络设置失败: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 「AI 与验证码服务」设置
+# 独立 JSON (/app/capability.json), 不写进 config.toml, 密钥不出现在配置导出里.
+# ---------------------------------------------------------------------------
+class CapabilitySettingsPayload(BaseModel):
+    llm_enabled: bool = True
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = "gpt-4o-mini"
+    llm_vision_model: str = ""
+    llm_proxy: str = ""
+    llm_timeout: float = Field(40.0, gt=0)
+    captcha_enabled: bool = True
+    captcha_api_url: str = ""
+    captcha_api_key: str = ""
+    captcha_proxy: str = ""
+    captcha_timeout: float = Field(60.0, gt=0)
+
+
+class CapabilityTestPayload(BaseModel):
+    target: str = Field("llm", pattern="^(llm|captcha)$")
+
+
+@router.get("/settings/capability")
+async def get_capability_settings():
+    try:
+        return capability_settings.public_view()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"加载能力设置失败: {e}")
+
+
+@router.post("/settings/capability")
+async def save_capability_settings(payload: CapabilitySettingsPayload):
+    try:
+        capability_settings.save(capability_settings.merge_secret_update(payload.model_dump()))
+        return {"success": True}
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=format_errors(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存能力设置失败: {e}")
+
+
+@router.post("/settings/capability/test")
+async def test_capability(payload: CapabilityTestPayload):
+    """真实发起一次请求, 验证配置是否可用 (会消耗一次模型/求解调用)."""
+    from ..telegram.capability import provider
+
+    try:
+        if payload.target == "llm":
+            if not provider.llm_enabled:
+                return {"success": False, "detail": "尚未填写模型服务地址"}
+            answer, by = await provider.chat("请只回复 OK 两个字符.")
+            return {
+                "success": bool(answer),
+                "detail": (
+                    f"{by}: {str(answer)[:120]}" if answer else "模型无响应, 请检查地址 / 密钥 / 模型名"
+                ),
+            }
+        if not provider.captcha_enabled:
+            return {"success": False, "detail": "尚未填写验证码服务地址"}
+        token = await provider.solve_captcha("__connectivity_test__", None, "token")
+        return {
+            "success": bool(token),
+            "detail": "服务可达并返回 token" if token else "服务未返回 token, 请检查响应格式",
+        }
+    except Exception as e:
+        return {"success": False, "detail": f"测试失败: {e}"}

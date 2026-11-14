@@ -13,18 +13,23 @@ Telegram Bot ``@embykeeper_auth_bot`` 后面. 该 Bot 既是「赞助等级」�
   未配置则快速返回 None, 对应站点自行跳过;
 * OCR -> 复用项目自带的 ddddocr (``embykeeper/ocr.py``), 在 link.py 中接入.
 
-所有配置走环境变量, 不改 config.toml / schema, Docker 里直接加即可.
-未配置的能力不产生任何网络请求, 避免每个站点都卡满 60s x 3 的重试.
+配置来源 (优先级从高到低):
+  1. 环境变量 ``EK_LLM_*`` / ``EK_CAPTCHA_*`` (纯 Docker 部署用);
+  2. 面板「AI 与验证码服务」页保存到 ``/app/capability.json``;
+  3. 都没有 -> 能力关闭, 不产生任何网络请求, 对应站点快速跳过.
+
+面板保存后按文件 mtime 自动重载, 无需重启进程.
 """
 
 from __future__ import annotations
 
 import base64
-import os
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import httpx
 from loguru import logger
+
+from embykeeper import capability_settings as settings
 
 log = logger.bind(scheme="capability")
 
@@ -40,13 +45,9 @@ INFER_SYSTEM = (
 )
 
 
-def _env(name: str, default: str = "") -> str:
-    return (os.environ.get(name) or default).strip()
-
-
-def _env_float(name: str, default: float) -> float:
+def _as_float(value: Any, default: float) -> float:
     try:
-        return float(os.environ.get(name) or default)
+        return float(value) if value not in (None, "") else default
     except (TypeError, ValueError):
         return default
 
@@ -64,25 +65,17 @@ def _mime(data: bytes) -> str:
 class CapabilityProvider:
     """把云端能力路由到本地 / 自建服务; 未配置的能力一律快速失败."""
 
-    # --- OpenAI 兼容端点 -------------------------------------------------
-    # EK_LLM_BASE_URL   例: https://api.openai.com/v1 或 http://ollama:11434/v1
-    # EK_LLM_API_KEY    自建端点可留空
-    # EK_LLM_MODEL      默认 gpt-4o-mini
-    # EK_LLM_VISION_MODEL  视觉模型, 留空则复用 EK_LLM_MODEL
-    # EK_LLM_PROXY      可选, 访问境外 API 时显式指定; 默认不读环境代理
-    # EK_LLM_TIMEOUT    默认 40 秒
-
     @property
     def llm_enabled(self) -> bool:
-        return bool(_env("EK_LLM_BASE_URL"))
+        return bool(settings.get("llm_base_url"))
 
     @property
     def captcha_enabled(self) -> bool:
-        return bool(_env("EK_CAPTCHA_API_URL"))
+        return bool(settings.get("captcha_api_url"))
 
-    def _client(self, *, timeout: float, proxy_var: str) -> httpx.AsyncClient:
+    @staticmethod
+    def _client(*, timeout: float, proxy: str = "") -> httpx.AsyncClient:
         kwargs = {"timeout": timeout, "trust_env": False}
-        proxy = _env(proxy_var)
         if proxy:
             kwargs["proxy"] = proxy
         return httpx.AsyncClient(**kwargs)
@@ -96,15 +89,12 @@ class CapabilityProvider:
         system: str = ANSWER_SYSTEM,
     ) -> Tuple[Optional[str], Optional[str]]:
         """调用 OpenAI 兼容的 /chat/completions, 返回 (答案, 来源标识)."""
-        base = _env("EK_LLM_BASE_URL").rstrip("/")
+        base = str(settings.get("llm_base_url") or "").rstrip("/")
         if not base:
             return None, None
 
-        model = (
-            _env("EK_LLM_VISION_MODEL")
-            if vision and _env("EK_LLM_VISION_MODEL")
-            else _env("EK_LLM_MODEL", "gpt-4o-mini")
-        )
+        vision_model = str(settings.get("llm_vision_model") or "")
+        model = vision_model if vision and vision_model else str(settings.get("llm_model") or "gpt-4o-mini")
         if image:
             encoded = base64.b64encode(image).decode()
             content = [
@@ -115,7 +105,7 @@ class CapabilityProvider:
             content = prompt
 
         headers = {"Content-Type": "application/json"}
-        key = _env("EK_LLM_API_KEY")
+        key = str(settings.get("llm_api_key") or "")
         if key:
             headers["Authorization"] = f"Bearer {key}"
 
@@ -128,7 +118,8 @@ class CapabilityProvider:
         }
         try:
             async with self._client(
-                timeout=_env_float("EK_LLM_TIMEOUT", 40), proxy_var="EK_LLM_PROXY"
+                timeout=_as_float(settings.get("llm_timeout"), 40),
+                proxy=str(settings.get("llm_proxy") or ""),
             ) as client:
                 resp = await client.post(f"{base}/chat/completions", json=payload, headers=headers)
                 resp.raise_for_status()
@@ -142,23 +133,24 @@ class CapabilityProvider:
     async def solve_captcha(self, site: str, url: Optional[str] = None, kind: str = "token") -> Optional[str]:
         """调用自建 Turnstile / hCaptcha solver.
 
-        约定: POST ``EK_CAPTCHA_API_URL``, JSON ``{"site": ..., "url": ..., "kind": ...}``,
+        约定: POST ``captcha_api_url``, JSON ``{"site": ..., "url": ..., "kind": ...}``,
         响应 JSON 中的 ``token`` / ``content`` / ``cf_clearance`` 字段即为结果.
-        ``EK_CAPTCHA_API_KEY`` 若设置, 会以 ``Authorization: Bearer`` 发送.
+        ``captcha_api_key`` 若设置, 会以 ``Authorization: Bearer`` 发送.
         """
-        endpoint = _env("EK_CAPTCHA_API_URL")
+        endpoint = str(settings.get("captcha_api_url") or "")
         if not endpoint:
             return None
 
         headers = {"Content-Type": "application/json"}
-        key = _env("EK_CAPTCHA_API_KEY")
+        key = str(settings.get("captcha_api_key") or "")
         if key:
             headers["Authorization"] = f"Bearer {key}"
 
         payload = {"site": site, "url": url, "kind": kind}
         try:
             async with self._client(
-                timeout=_env_float("EK_CAPTCHA_TIMEOUT", 60), proxy_var="EK_CAPTCHA_PROXY"
+                timeout=_as_float(settings.get("captcha_timeout"), 60),
+                proxy=str(settings.get("captcha_proxy") or ""),
             ) as client:
                 resp = await client.post(endpoint, json=payload, headers=headers)
                 resp.raise_for_status()

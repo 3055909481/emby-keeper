@@ -2,16 +2,21 @@
 # =============================================================================
 # embykeeper 8.1.1 面板模式「单容器后台服务 + 离线自足」补丁
 #
-# 一次装齐 4 个文件 (容器内路径相对 embykeeper 包目录):
+# 一次装齐 6 个文件 (容器内路径相对 embykeeper 包目录):
 #   panel_scheduler_init.py -> api/__init__.py          API 进程内启动计划任务
+#   api_config.py           -> api/config.py            面板「AI 与验证码服务」设置端点
 #   link.py                 -> telegram/link.py         取消云端认证 / 能力本地化
 #   capability.py           -> telegram/capability.py   本地模型 / 验证码服务提供者
+#   capability_settings.py  -> capability_settings.py   面板配置读写 (/app/capability.json)
 #   session.py              -> telegram/session.py      世界时间检测多源容错
 #
-# 重要: link.py 会 import capability.py, 两个文件必须同时安装, 否则容器启动时
-#       会抛 ModuleNotFoundError. 这也是本脚本改为批量安装的原因.
+# 重要: capability.py 会 import capability_settings.py, 这些文件必须同时安装,
+#       否则容器启动时抛 ModuleNotFoundError. 本脚本因此采用批量安装 + 整体回滚.
 #
-# 用法 (在 Docker 宿主机上执行, 4 个 .py 文件与脚本放同一目录):
+# 注意: 本脚本只替换容器内的 Python 源码; 新增的 Web 配置页属于已构建的前端
+#       静态资源, 只能通过使用 CI 构建的新镜像获得 (Build Docker Image Artifact).
+#
+# 用法 (在 Docker 宿主机上执行, 6 个 .py 文件与脚本放同一目录):
 #   bash apply_patch.sh                # 自动查找面板容器并打补丁
 #   bash apply_patch.sh <容器名或ID>    # 明确指定容器
 #   bash apply_patch.sh --rollback [容器名或ID]
@@ -24,8 +29,10 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_MAP=(
   "panel_scheduler_init.py|api/__init__.py"
+  "api_config.py|api/config.py"
   "link.py|telegram/link.py"
   "capability.py|telegram/capability.py"
+  "capability_settings.py|capability_settings.py"
   "session.py|telegram/session.py"
 )
 BACKUP_DIR="$SCRIPT_DIR/.panel-patch-backup"
@@ -128,7 +135,7 @@ done
 echo "   宿主机备份目录: $BACKUP_DIR"
 
 # --- 5. 覆盖全部补丁 ---------------------------------------------------------
-info "写入 4 个补丁文件"
+info "写入 6 个补丁文件"
 for entry in "${PATCH_MAP[@]}"; do
     src="${entry%%|*}"; rel="${entry#*|}"
     docker cp "$SCRIPT_DIR/$src" "$CONTAINER:$PKG_DIR/$rel" >/dev/null
@@ -137,15 +144,15 @@ done
 
 # --- 6. 容器内校验 (AST + 真实 import, 失败整体回滚) ------------------------
 info "容器内语法与依赖校验"
-if ! docker exec -i "$CONTAINER" python - "$PKG_DIR" <<'PY'
+if ! docker exec -i "$CONTAINER" python - "$PKG_DIR" "${PATCH_MAP[@]##*|}" <<'PY'
 import ast
 import pathlib
 import sys
 
 base = pathlib.Path(sys.argv[1])
-for rel in ("api/__init__.py", "telegram/link.py", "telegram/capability.py", "telegram/session.py"):
+for rel in sys.argv[2:]:
     ast.parse((base / rel).read_text(encoding="utf-8"))
-print("  AST OK (4 files)")
+print(f"  AST OK ({len(sys.argv) - 2} files)")
 PY
 then
     echo "语法校验失败, 正在整体回滚..." >&2
@@ -154,7 +161,7 @@ then
 fi
 
 if ! docker exec "$CONTAINER" python -c \
-    'import embykeeper.telegram.link, embykeeper.telegram.capability; print("  import OK")'; then
+    'import embykeeper.capability_settings, embykeeper.telegram.link, embykeeper.telegram.capability; print("  import OK")'; then
     echo "导入校验失败, 正在整体回滚..." >&2
     restore_all
     die "补丁未生效, 已恢复全部原文件"
@@ -189,6 +196,9 @@ cat <<EOF
 
 完成。仍是「一个容器、一个进程」: 面板 (8000) -> 业务后端 (127.0.0.1:8001)
 -> 同一进程内的计划任务调度. 面板里新增/修改账号后会自动重建调度, 无需重启.
+
+本次已装好后端设置端点 /api/settings/capability, 可用 API 直接配置 LLM / solver;
+侧边栏的「AI 与验证码服务」页面需要换成 CI 构建的新镜像才会出现.
 
 本次补丁同时取消了 @embykeeper_auth_bot 的授权门禁:
   默认视作高级用户, 进程不再向该 Bot 发任何消息, 签到/监控/水群不会再被认证卡住.
