@@ -675,7 +675,9 @@ async def test_capability(payload: CapabilityTestPayload):
             return {
                 "success": bool(answer),
                 "detail": (
-                    f"{by}: {str(answer)[:120]}" if answer else "模型无响应, 请检查地址 / 密钥 / 模型名"
+                    f"{by}: {str(answer)[:120]}"
+                    if answer
+                    else "模型无响应或服务端错误, 请查看运行日志中的网关响应正文 (常见为中转渠道不可用)"
                 ),
             }
         if not provider.captcha_enabled:

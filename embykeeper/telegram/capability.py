@@ -62,6 +62,25 @@ def _mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+def _http_error_detail(e: BaseException) -> str:
+    """带出网关响应正文.
+
+    聚合网关在「无可用渠道 / 上游全挂 / 额度不足 / 限流」时通常只回一个 503,
+    真正的原因写在 body 里; 而 httpx 的异常字符串不含正文, 会让日志失去线索.
+    """
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        try:
+            body = " ".join((e.response.text or "").split())[:300]
+        except Exception:
+            body = ""
+        hint = ""
+        if status in (429, 500, 502, 503, 504):
+            hint = " (多为中转上游不可用/无可用渠道/限流)"
+        return f"HTTP {status}{hint}: {body or str(e).splitlines()[0]}"
+    return str(e)
+
+
 class CapabilityProvider:
     """把云端能力路由到本地 / 自建服务; 未配置的能力一律快速失败."""
 
@@ -127,7 +146,7 @@ class CapabilityProvider:
             answer = (data["choices"][0]["message"].get("content") or "").strip()
             return (answer, f"local:{model}") if answer else (None, None)
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
-            log.warning(f"本地模型调用失败 ({model}): {e}")
+            log.warning(f"本地模型调用失败 ({model}): {_http_error_detail(e)}")
             return None, None
 
     async def solve_captcha(self, site: str, url: Optional[str] = None, kind: str = "token") -> Optional[str]:
@@ -159,7 +178,7 @@ class CapabilityProvider:
                 return None
             return data.get(kind) or data.get("token") or data.get("answer") or None
         except (httpx.HTTPError, TypeError, ValueError) as e:
-            log.warning(f"自建验证码服务调用失败 ({site}): {e}")
+            log.warning(f"自建验证码服务调用失败 ({site}): {_http_error_detail(e)}")
             return None
 
 
