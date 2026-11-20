@@ -711,11 +711,14 @@ class Emby:
         last_login_date = user.json().get("LastLoginDate", None)
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
-        await self._request(
-            method="GET",
-            path=f"/DisplayPreferences/usersettings",
-            params=dict(client="emby", userId=self.user_id),
-        )
+        try:
+            await self._request(
+                method="GET",
+                path="/DisplayPreferences/usersettings",
+                params=dict(client="emby", userId=self.user_id),
+            )
+        except EmbyError:
+            self.log.debug("跳过显示偏好请求 (不影响保活).")
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
         await self.get_resume_items(media_types=["Video"])
