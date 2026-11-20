@@ -27,6 +27,7 @@ from pyrogram.raw.types import PeerNotifySettings, InputNotifyPeer
 from thefuzz import fuzz, process
 
 from embykeeper import __name__ as __product__
+from embykeeper.cache import cache
 from embykeeper.ocr import CharRange, OCRService
 from embykeeper.runinfo import RunContext
 from embykeeper.utils import show_exception, to_iterable, format_timedelta_human, AsyncCountPool
@@ -108,6 +109,109 @@ class BaseBotCheckin(ABC):
 
         self._task = None  # 主任务
 
+        # 本次签到解析出的积分, 供看板持久化使用 (无积分来源时为 None)
+        self._checkin_points: Optional[Union[int, float, str]] = None
+        self._checkin_increase: Optional[Union[int, float, str]] = None
+
+    @staticmethod
+    def _normalize_points(value):
+        """把积分文本规范化为数字 (可能时), 否则保留原字符串."""
+        if value is None:
+            return None
+        text = str(value).strip().replace(",", "").replace("，", "")
+        try:
+            number = float(text)
+            return int(number) if number.is_integer() else number
+        except ValueError:
+            return str(value).strip()
+
+    def _extract_points(self, text: str, pattern: str = None):
+        """从签到成功消息中解析 (当前积分, 本次增加).
+
+        注意: 上游默认模式 ``(\\d+)[^\\d]*(\\d+)`` 的 ``[^\\d]*`` 可匹配空串,
+        单个数字 "100" 会被拆成 ('10','0'). 通过判断两组之间是否存在分隔符
+        来识别这种情况, 避免把同一个数误读成两个数.
+        """
+        if text is None:
+            return None, None
+        text = str(text)
+        pat = pattern or getattr(self, "bot_success_pat", None)
+        match = None
+        if pat:
+            try:
+                match = re.search(pat, text)
+            except re.error:
+                match = None
+        if match and match.groups():
+            first = match.group(1)
+            second = match.group(2) if len(match.groups()) >= 2 else None
+            if first not in (None, ""):
+                if second not in (None, ""):
+                    full = match.group(0)
+                    between = full[full.find(first) + len(first) :]
+                    separator = between[: between.find(second)]
+                    if separator == "":
+                        # 两组数字紧邻 => 同一个数被正则拆开
+                        return self._normalize_points(first + second), None
+                    return self._normalize_points(second), self._normalize_points(first)
+                return self._normalize_points(first), None
+        # 兜底: 直接取文本中的数字 (首个为增加, 次个为当前, 与主流 "+ X 分 -> Y 分" 文案一致)
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", text)
+        if len(numbers) >= 2:
+            return self._normalize_points(numbers[1]), self._normalize_points(numbers[0])
+        if numbers:
+            return self._normalize_points(numbers[0]), None
+        return None, None
+
+    def _record_checkin_result(self):
+        """把本次签到结果与积分持久化到看板缓存 (失败不中断签到流程)."""
+        try:
+            phone = str(getattr(self.client, "phone_number", "") or "")
+            site = str(
+                getattr(self, "templ_name", None)
+                or self.name
+                or self.__class__.__module__.rsplit(".", 1)[-1]
+                or "unknown"
+            )
+            # 缓存以 "." 分层, 替换字符避免破坏键结构
+            phone_key = phone.replace(".", "_") or "unknown"
+            site_key = site.replace(".", "_")
+
+            status = self.ctx.status
+            if status == RunStatus.SUCCESS:
+                mapped = "success"
+            elif status == RunStatus.NONEED:
+                mapped = "checked"
+            elif status in (RunStatus.FAIL, RunStatus.ERROR, RunStatus.CANCELLED):
+                mapped = "failed"
+            elif status == RunStatus.RESCHEDULE:
+                mapped = "pending"
+            else:
+                mapped = "failed"
+
+            # 兜底: 部分站点 (aurora/nebula 等) 直接 finish(), 积分只写在日志里
+            if self._checkin_points is None:
+                for log_record in reversed(list(self.ctx.log or [])):
+                    message = getattr(log_record, "message", "") or ""
+                    if "签到成功" in message and ("分" in message or "币" in message or ":" in message):
+                        current, increase = self._extract_points(message)
+                        if current is not None:
+                            self._checkin_points, self._checkin_increase = current, increase
+                            break
+
+            record = {
+                "status": mapped,
+                "time": datetime.now().isoformat(),
+                "detail": str(self.ctx.status_info or ""),
+                "points": self._normalize_points(self._checkin_points),
+                "increase": self._normalize_points(self._checkin_increase),
+                "site": site,
+                "phone": phone,
+            }
+            cache.set(f"checkin.site_history.{phone_key}.{site_key}", record)
+        except Exception as e:
+            self.log.debug(f"[gray50]签到结果记录失败: {e}[/]")
+
     @property
     def retries(self):
         return self._retries or config.checkiner.retries
@@ -130,6 +234,8 @@ class BaseBotCheckin(ABC):
             else:
                 raise
         finally:
+            # 无论成功/失败/超时, 都把结果与积分落到看板缓存
+            self._record_checkin_result()
             self.client.stop_handlers.remove(self.stop)
             self._task = None
 
@@ -590,6 +696,9 @@ class BotCheckin(BaseBotCheckin):
             await self.retry()
         elif any(s in text for s in to_iterable(self.bot_success_keywords) or default_keywords["success"]):
             if await self.before_success():
+                # 解析积分供看板使用 (与日志解析相互独立, 不因缺积分影响签到)
+                current, increase = self._extract_points(text)
+                self._checkin_points, self._checkin_increase = current, increase
                 if self.bot_success_pat:
                     matches = re.search(self.bot_success_pat, text)
                     if matches:

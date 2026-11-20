@@ -9,6 +9,7 @@ import Runinfo from './views/Runinfo.vue'
 import Sites from './views/Sites.vue'
 import Settings from './views/Settings.vue'
 import Capability from './views/Capability.vue'
+import CheckinBoard from './views/CheckinBoard.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -36,6 +37,7 @@ const router = createRouter({
     { path: '/subsonic', component: Subsonic, meta: { requiresAuth: true } },
     { path: '/runinfo', component: Runinfo, meta: { requiresAuth: true } },
     { path: '/sites', component: Sites, meta: { requiresAuth: true } },
+    { path: '/checkin', component: CheckinBoard, meta: { requiresAuth: true } },
     { path: '/settings', component: Settings, meta: { requiresAuth: true } },
     { path: '/capability', component: Capability, meta: { requiresAuth: true } },
   ]

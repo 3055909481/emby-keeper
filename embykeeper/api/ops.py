@@ -771,6 +771,58 @@ async def get_ops_overview(
         raise HTTPException(status_code=500, detail=f"Failed to build ops overview: {exc}") from exc
 
 
+def _scan_checkin_history() -> List[Dict[str, Any]]:
+    """扫描 checkin.site_history.* 缓存, 返回每个账号/站点的最新签到记录."""
+    prefix = "checkin.site_history."
+    keys = cache.find_by_prefix(prefix)
+    latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for key in keys:
+        raw = cache.get(key, None)
+        if not isinstance(raw, dict):
+            continue
+        parts = key[len(prefix) :].split(".")
+        if len(parts) < 2:
+            continue
+        phone_key, site_key = parts[0], ".".join(parts[1:])
+        stamp = str(raw.get("time") or "")
+        identity = (phone_key, site_key)
+        previous = latest.get(identity)
+        if previous is None or stamp > str(previous.get("time") or ""):
+            latest[identity] = raw
+    return list(latest.values())
+
+
+@router.get("/ops/checkin-sites")
+async def get_ops_checkin_sites(_: bool = Depends(require_auth)):
+    """Per-site checkin status and current points for the checkin board.
+
+    Data is written by checkiner.finish(); records without a points source keep
+    ``points`` as null so the UI can show a placeholder.
+    """
+    try:
+        records = _scan_checkin_history()
+        rows: List[Dict[str, Any]] = []
+        for item in records:
+            rows.append(
+                {
+                    "phone": item.get("phone") or "",
+                    "phone_masked": (
+                        TelegramAccount.get_phone_masked(item.get("phone") or "") if item.get("phone") else ""
+                    ),
+                    "site": item.get("site") or "",
+                    "status": item.get("status") or "unknown",
+                    "time": item.get("time"),
+                    "detail": item.get("detail") or "",
+                    "points": item.get("points"),
+                    "increase": item.get("increase"),
+                }
+            )
+        rows.sort(key=lambda r: (str(r.get("phone") or ""), str(r.get("site") or "")))
+        return {"items": rows, "total": len(rows)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to build checkin site board: {exc}") from exc
+
+
 def _day_state_for_calendar(attention: int, success: int, total: int) -> str:
     if attention > 0:
         return "attention"

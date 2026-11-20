@@ -12,6 +12,7 @@ import {
   MusicalNoteIcon,
   ChartBarIcon,
   PuzzlePieceIcon,
+  ClipboardDocumentListIcon,
   Cog6ToothIcon,
   SparklesIcon,
   ArrowRightOnRectangleIcon
@@ -28,6 +29,7 @@ const navigation = [
   { name: 'Emby 账号', href: '/emby', icon: TvIcon },
   { name: 'Subsonic 账号', href: '/subsonic', icon: MusicalNoteIcon },
   { name: '任务记录', href: '/runinfo', icon: ChartBarIcon },
+  { name: '签到看板', href: '/checkin', icon: ClipboardDocumentListIcon },
   { name: '自定义站点', href: '/sites', icon: PuzzlePieceIcon },
   { name: 'AI 与验证码', href: '/capability', icon: SparklesIcon },
   { name: '系统设置', href: '/settings', icon: Cog6ToothIcon },
