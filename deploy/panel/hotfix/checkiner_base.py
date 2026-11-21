@@ -199,6 +199,9 @@ class BaseBotCheckin(ABC):
                             self._checkin_points, self._checkin_increase = current, increase
                             break
 
+            # 显示名称: self.name 是日志里绑定的名字 (config.name 或内置站点 name),
+            # site 是标识名 (如 templ_a / diacg_emb_y); 两者都存, 看板可同时展示.
+            display_name = str(getattr(self, "name", None) or "").strip() or site
             record = {
                 "status": mapped,
                 "time": datetime.now().isoformat(),
@@ -206,6 +209,7 @@ class BaseBotCheckin(ABC):
                 "points": self._normalize_points(self._checkin_points),
                 "increase": self._normalize_points(self._checkin_increase),
                 "site": site,
+                "display_name": display_name,
                 "phone": phone,
             }
             cache.set(f"checkin.site_history.{phone_key}.{site_key}", record)

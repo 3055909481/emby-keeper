@@ -827,6 +827,7 @@ async def get_ops_checkin_sites(_: bool = Depends(require_auth)):
                         TelegramAccount.get_phone_masked(item.get("phone") or "") if item.get("phone") else ""
                     ),
                     "site": item.get("site") or "",
+                    "display_name": item.get("display_name") or item.get("site") or "",
                     "status": item.get("status") or "unknown",
                     "time": item.get("time"),
                     "detail": item.get("detail") or "",

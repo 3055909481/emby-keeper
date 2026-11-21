@@ -17,6 +17,7 @@ type CheckinSiteRow = {
   phone: string
   phone_masked: string
   site: string
+  display_name: string
   status: string
   time: string | null
   detail: string
@@ -166,7 +167,12 @@ function statusIcon(status: StatusKind) {
           <tbody class="divide-y divide-slate-100">
             <tr v-for="(row, index) in rows" :key="`${row.phone}-${row.site}-${index}`" class="hover:bg-slate-50/70">
               <td class="px-3 py-3 font-mono text-xs text-slate-600">{{ row.phone_masked || '—' }}</td>
-              <td class="px-3 py-3 font-medium text-slate-900">{{ row.site }}</td>
+              <td class="px-3 py-3">
+                <p class="font-medium text-slate-900">{{ row.display_name || row.site || '—' }}</p>
+                <p v-if="row.display_name && row.display_name !== row.site" class="mt-0.5 font-mono text-xs text-slate-400">
+                  {{ row.site }}
+                </p>
+              </td>
               <td class="px-3 py-3">
                 <UiBadge :variant="STATUS_META[statusOf(row)].variant" size="sm">
                   <component :is="statusIcon(statusOf(row))" class="mr-1 inline-block h-3.5 w-3.5" aria-hidden="true" />
