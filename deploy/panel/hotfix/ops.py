@@ -772,20 +772,37 @@ async def get_ops_overview(
 
 
 def _scan_checkin_history() -> List[Dict[str, Any]]:
-    """扫描 checkin.site_history.* 缓存, 返回每个账号/站点的最新签到记录."""
+    """扫描 checkin.site_history.* 缓存, 返回每个账号/站点的最新签到记录.
+
+    兼容两种缓存后端:
+    - JSON: checkin.site_history 是一棵嵌套 dict, 而 find_by_prefix 只返回叶子键
+      (例如 ...账号.站点.status), 直接 get 会拿到标量, 因此这里读取整棵子树遍历.
+    - MongoDB: 每条记录是带完整键的文档, 用 find_by_prefix 扫描.
+    """
     prefix = "checkin.site_history."
-    keys = cache.find_by_prefix(prefix)
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
+
+    root = cache.get("checkin.site_history", None)
+    if isinstance(root, dict):
+        for phone_key, sites in root.items():
+            if not isinstance(sites, dict):
+                continue
+            for site_key, raw in sites.items():
+                if isinstance(raw, dict) and ("status" in raw or "time" in raw):
+                    candidates.append((f"{phone_key}.{site_key}", raw))
+    else:
+        for key in cache.find_by_prefix(prefix):
+            raw = cache.get(key, None)
+            if isinstance(raw, dict) and ("status" in raw or "time" in raw):
+                candidates.append((key[len(prefix) :], raw))
+
     latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for key in keys:
-        raw = cache.get(key, None)
-        if not isinstance(raw, dict):
-            continue
-        parts = key[len(prefix) :].split(".")
+    for identity_str, raw in candidates:
+        parts = identity_str.split(".")
         if len(parts) < 2:
             continue
-        phone_key, site_key = parts[0], ".".join(parts[1:])
+        identity = (parts[0], ".".join(parts[1:]))
         stamp = str(raw.get("time") or "")
-        identity = (phone_key, site_key)
         previous = latest.get(identity)
         if previous is None or stamp > str(previous.get("time") or ""):
             latest[identity] = raw
